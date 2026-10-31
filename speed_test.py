@@ -3,7 +3,7 @@ import ollama
 
 CHAT_MODEL = "qwen3.5:4b"
 EMBED_MODEL = "bge-m3"
-NUM_CTX = 32768   # ต้องตรงกับ NUM_CTX ใน app.py ไม่งั้น Ollama จะโหลดโมเดลใหม่
+NUM_CTX = 8192   # ต้องตรงกับ NUM_CTX ใน app.py ไม่งั้น Ollama จะโหลดโมเดลใหม่
 
 
 def test(label, function):
