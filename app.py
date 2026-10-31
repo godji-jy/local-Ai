@@ -3,8 +3,12 @@ import os
 # ต้องตั้งก่อน import gradio ไม่งั้นไม่มีผล
 os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 
+import base64
+import hashlib
+import io
 import json
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -27,16 +31,29 @@ GR_MAJOR = int(gr.__version__.split(".")[0])
 # ---------------------------------------------------------
 # ตั้งค่า (ปรับได้)
 # ---------------------------------------------------------
+# ชุดค่านี้จูนสำหรับ: Intel i5-11400H (6 คอร์) + RAM 16 GB + RTX 3050 Laptop (VRAM 4 GB)
+#
+# เป้าหมายคือให้โมเดลอยู่บน GPU "ทั้งหมด" เพราะเร็วที่สุด
+#   ตรวจด้วยคำสั่ง  ollama ps  ช่อง PROCESSOR ต้องเป็น "100% GPU"
+#   - ถ้าขึ้นเป็นสัดส่วน CPU/GPU แปลว่า NUM_CTX ใหญ่เกิน VRAM -> ลดลง
+#   - ถ้าเป็น 100% GPU และ nvidia-smi ยังเหลือ VRAM -> ค่อยๆ เพิ่ม NUM_CTX (12288, 16384)
+#
 # NUM_CTX = ที่ว่างรวมของ prompt + ประวัติ + ข้อมูลที่ค้นมา + คำตอบ
 # ต้องเท่ากันทุกการเรียก ถ้าเปลี่ยนไปมา Ollama จะโหลดโมเดลใหม่ทุกครั้ง (ช้า)
-# ถ้า RAM/VRAM ไม่พอหรือช้าเกินไป ให้ลดเป็น 16384 หรือ 8192
-NUM_CTX = 32768
-MAX_TOKENS_FAST = 8192       # คำตอบสูงสุดโหมดปกติ
-MAX_TOKENS_THINK = 16384     # โหมดคิดลึก (token ที่ใช้คิดนับรวมด้วย)
+NUM_CTX = 8192
+MAX_TOKENS_FAST = 3072       # คำตอบสูงสุดโหมดปกติ
+MAX_TOKENS_THINK = 5120      # โหมดคิดลึก (token ที่ใช้คิดนับรวมด้วย)
+
+NUM_THREAD = 6               # จำนวนเธรด CPU = จำนวนคอร์จริง (i5-11400H มี 6 คอร์) ตั้ง None = ให้ Ollama เลือก
+NUM_GPU = None               # จำนวนเลเยอร์ของโมเดลแชตบน GPU: None = อัตโนมัติ, 0 = รันบน CPU ล้วน
+EMBED_ON_CPU = True          # ให้ bge-m3 (ค้นเว็บ/ไฟล์/ฐานความรู้) รันบน CPU เหลือ VRAM ให้โมเดลแชต
+KEEP_ALIVE = "30m"           # ค้างโมเดลไว้ในหน่วยความจำนานเท่าไหร่หลังใช้งานล่าสุด (กันโหลดซ้ำ)
+WARM_UP = True               # โหลดโมเดลล่วงหน้าตอนเปิดแอป คำถามแรกจะไม่ต้องรอ
+STREAM_INTERVAL = 0.05       # อัปเดตข้อความบนหน้าจอทุกกี่วินาที (ลดภาระหน้าจอ ลื่นขึ้น)
 
 # ประวัติแชตที่ส่งให้โมเดล (ยิ่งเยอะ AI ยิ่งจำบทสนทนาได้นาน แต่ใช้ NUM_CTX มากขึ้น)
-HISTORY_MESSAGES = 12
-HISTORY_CHARS = 4000
+HISTORY_MESSAGES = 6
+HISTORY_CHARS = 1500
 
 # ไฟล์ที่แนบในแชต
 FILE_TYPES = [
@@ -47,19 +64,25 @@ FILE_TYPES = [
 MAX_FILES = 5                # แนบได้กี่ไฟล์พร้อมกัน
 MAX_FILE_MB = 20             # ขนาดไฟล์สูงสุดต่อไฟล์
 FILE_STORE_CHARS = 600_000   # เก็บข้อความต่อไฟล์ไม่เกินกี่ตัวอักษร
-FILE_FULL_CHARS = 20000      # รวมไม่เกินนี้ = ส่งทั้งไฟล์ / เกิน = เลือกเฉพาะส่วนที่ตรงคำถาม
+FILE_FULL_CHARS = 6000       # รวมไม่เกินนี้ = ส่งทั้งไฟล์ / เกิน = เลือกเฉพาะส่วนที่ตรงคำถาม
 FILE_CHUNK_CHARS = 1200      # ขนาดชิ้นเมื่อไฟล์ยาว
-FILE_TOP_CHUNKS = 10         # จำนวนชิ้นที่ส่งให้โมเดลเมื่อไฟล์ยาว
+FILE_TOP_CHUNKS = 5          # จำนวนชิ้นที่ส่งให้โมเดลเมื่อไฟล์ยาว
+
+# รูปภาพที่แนบ/วางจากคลิปบอร์ด (ต้องใช้โมเดลที่อ่านรูปได้)
+IMAGE_TYPES = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]
+MAX_IMAGES = 4               # แนบรูปได้กี่รูปพร้อมกัน
+IMAGE_MAX_SIDE = 1024        # ย่อรูปให้ด้านยาวสุดไม่เกินกี่พิกเซล
+VISION_MODEL = ""            # โมเดลสำรองที่อ่านรูปได้ (ใช้เมื่อ MODEL อ่านรูปไม่ได้) เช่น "qwen2.5vl:7b"
 
 SEARCH_MAX_RESULTS = 6
 FETCH_PAGES = 3
 PAGE_CHARS = 8000
 CHUNK_CHARS = 700
-WEB_TOP_PASSAGES = 5
+WEB_TOP_PASSAGES = 4
 SNIPPET_CHARS = 300
-PASSAGE_CHARS = 800
+PASSAGE_CHARS = 700
 
-KB_TOP = 4
+KB_TOP = 3
 KB_MAX_DISTANCE = 0.55
 
 HTTP_HEADERS = {"User-Agent": "LocalAI/1.0 (local Gradio app)"}
@@ -154,79 +177,120 @@ ANSWER STYLE:
 def get_page_text(language):
     if language == LANG_EN:
         return {
-            "eyebrow": "PRIVATE · RUNS LOCALLY",
-            "heading": "ASK.<br>LEARN.<br><span class='g'>BUILD.</span>",
+            "tagline": "Ask anything. Learn something.",
             "description": (
-                "AI-powered assistant for programming, science and automation "
-                "that runs on your own computer and keeps you ahead."
+                "Programming, science, AI, automation and general "
+                "knowledge. Runs locally on your computer."
             ),
             "placeholder": "Ask Local AI anything...",
-            "start": "Start chatting ↗",
         }
 
     if language == LANG_AUTO:
         return {
-            "eyebrow": "LOCAL · PRIVATE · AUTO",
-            "heading": "ASK.<br>LEARN.<br><span class='g'>BUILD.</span>",
+            "tagline": "ถามได้ทุกเรื่อง · Ask anything",
             "description": (
-                "ผู้ช่วย AI ด้านการเรียน วิทยาศาสตร์ และการเขียนโปรแกรม "
-                "ทำงานภายในเครื่องของคุณ / Runs fully on your computer."
+                "การเรียน วิทยาศาสตร์ คอมพิวเตอร์ AI และการเขียนโปรแกรม "
+                "ทำงานภายในเครื่องของคุณ"
             ),
             "placeholder": "พิมพ์คำถามของคุณ... / Ask anything...",
-            "start": "Start / เริ่มแชต ↗",
         }
 
     return {
-        "eyebrow": "AI ส่วนตัว · รันในเครื่อง",
-        "heading": "ถามได้.<br>เรียนรู้ได้.<br><span class='g'>ทำได้จริง.</span>",
+        "tagline": "ถามอะไรก็ได้ เรียนรู้ได้ทุกวัน",
         "description": (
-            "ผู้ช่วย AI ด้านการเรียน วิทยาศาสตร์ การเขียนโปรแกรม และ Automation "
-            "ทำงานภายในเครื่องของคุณ ข้อมูลไม่ออกไปไหน"
+            "การเรียน วิทยาศาสตร์ คอมพิวเตอร์ การเขียนโปรแกรม AI "
+            "และ Automation ทำงานภายในเครื่องของคุณ"
         ),
         "placeholder": "พิมพ์คำถามของคุณ...",
-        "start": "เริ่มแชต ↗",
     }
 
 
 def make_topbar(language):
-    is_en = language == LANG_EN
-    model_label = f"{MODEL} · Local" if is_en else f"{MODEL} · รันในเครื่อง"
-    home = "Home" if is_en else "หน้าแรก"
-    badge = "Private" if is_en else "ส่วนตัว"
+    """ป้ายสีขาวมุมขวาบน (แบบช่อง Search ในดีไซน์) แสดงชื่อโมเดล"""
+    model_label = (
+        f"{MODEL} · Local" if language == LANG_EN else f"{MODEL} · รันในเครื่อง"
+    )
     return f"""
-    <div id="topbar">
-        <div class="brand"><span class="logo">L</span><span>LOCAL AI</span></div>
-        <div class="navpill">
-            <span class="item active">{home}<i></i></span>
-            <span class="item"><span class="dot"></span>{model_label}</span>
-        </div>
-        <div class="cta">{badge}<span class="arr">↗</span></div>
+    <div id="topbar" style="display:flex;align-items:center;gap:10px;background:#f3f3f1;
+         color:#15161a;border-radius:999px;padding:13px 20px;font-size:13px;font-weight:500;">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#15161a"
+             stroke-width="2" stroke-linecap="round" style="flex:none;">
+            <circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>
+        </svg>
+        <span style="color:#15161a;">{model_label}</span>
     </div>
     """
 
 
-def make_visual():
-    """โคมไฟแขวน + ลำแสง (CSS ล้วน)"""
+def make_logo():
     return """
-    <div id="lamp">
-        <div class="cord"></div>
-        <div class="cone"></div>
-        <div class="shade"></div>
-        <div class="bulb"></div>
+    <div style="width:64px;height:64px;border-radius:50%;background:#f3f3f1;
+         display:flex;align-items:center;justify-content:center;margin:0 auto;">
+        <svg width="34" height="34" viewBox="0 0 24 24" fill="#15161a">
+            <path d="M12 1.5c.7 5.6 4.9 9.8 10.5 10.5-5.6.7-9.8 4.9-10.5 10.5C11.3 16.9 7.1 12.7 1.5 12 7.1 11.3 11.3 7.1 12 1.5z"/>
+        </svg>
     </div>
+    """
+
+
+def make_avatar():
+    return """
+    <div style="width:46px;height:46px;border-radius:50%;background:#15161a;color:#fff;
+         display:flex;align-items:center;justify-content:center;font-weight:600;
+         font-size:18px;margin:0 auto;">L</div>
     """
 
 
 def make_header(language):
+    """ส่วนต้อนรับในการ์ดหลัก: ข้อความด้านซ้าย + ภาพทรงกลมด้านขวา"""
     t = get_page_text(language)
     return f"""
-    <div id="hero">
-        {make_visual()}
-        <div class="ghost">LOCAL AI</div>
-        <div class="eyebrow">{t["eyebrow"]}</div>
-        <h1>{t["heading"]}</h1>
-        <div class="dash"></div>
-        <p>{t["description"]}</p>
+    <div id="hero" style="display:flex;align-items:center;gap:8px;
+         height:calc(100vh - 290px);min-height:340px;padding:6px 10px;">
+        <div style="flex:1 1 55%;min-width:0;">
+            <div style="display:inline-block;font-size:11px;font-weight:600;letter-spacing:.16em;
+                 color:#15161a;border:1px solid #15161a;border-radius:999px;padding:5px 14px;
+                 margin-bottom:22px;">LOCAL AI</div>
+            <div style="font-size:clamp(28px,3.6vw,54px);font-weight:600;line-height:1.18;
+                 color:#15161a;letter-spacing:-.01em;">{t["tagline"]}</div>
+            <div style="margin-top:16px;font-size:14px;line-height:1.8;color:#4a4d55;max-width:460px;">
+                {t["description"]}</div>
+        </div>
+        <div style="flex:1 1 45%;min-width:0;display:flex;align-items:center;justify-content:center;">
+            <svg viewBox="0 0 400 400" style="width:100%;max-width:420px;height:auto;" xmlns="http://www.w3.org/2000/svg">
+                <defs>
+                    <radialGradient id="orb" cx="34%" cy="28%" r="80%">
+                        <stop offset="0%" stop-color="#8a8d94"/>
+                        <stop offset="35%" stop-color="#2b2d32"/>
+                        <stop offset="100%" stop-color="#050506"/>
+                    </radialGradient>
+                    <radialGradient id="glowOrange" cx="50%" cy="50%" r="50%">
+                        <stop offset="0%" stop-color="#ff8a2a" stop-opacity=".9"/>
+                        <stop offset="100%" stop-color="#ff8a2a" stop-opacity="0"/>
+                    </radialGradient>
+                    <radialGradient id="ball" cx="35%" cy="30%" r="75%">
+                        <stop offset="0%" stop-color="#ffffff"/>
+                        <stop offset="100%" stop-color="#a9acb3"/>
+                    </radialGradient>
+                </defs>
+                <ellipse cx="200" cy="352" rx="150" ry="16" fill="#000" fill-opacity=".22"/>
+                <g>
+                    <animateTransform attributeName="transform" type="translate"
+                        values="0 0;0 -10;0 0" dur="5s" repeatCount="indefinite"/>
+                    <circle cx="200" cy="190" r="150" fill="url(#orb)"/>
+                    <ellipse cx="200" cy="205" rx="150" ry="34" fill="none"
+                             stroke="#ff7a1a" stroke-width="5" stroke-opacity=".9"/>
+                    <ellipse cx="200" cy="205" rx="150" ry="34" fill="none"
+                             stroke="url(#glowOrange)" stroke-width="16" stroke-opacity=".35"/>
+                    <circle cx="200" cy="200" r="30" fill="#0a0a0c"/>
+                    <circle cx="200" cy="200" r="12" fill="#ff8a2a"/>
+                    <circle cx="206" cy="194" r="4" fill="#fff" fill-opacity=".9"/>
+                    <ellipse cx="140" cy="108" rx="52" ry="26" fill="#fff" fill-opacity=".22"
+                             transform="rotate(-28 140 108)"/>
+                </g>
+                <circle cx="334" cy="318" r="34" fill="url(#ball)"/>
+            </svg>
+        </div>
     </div>
     """
 
@@ -271,6 +335,19 @@ def detect_prompt_language(message):
     return LANG_EN
 
 
+def base_options():
+    """ตัวเลือกฮาร์ดแวร์ที่ต้องเหมือนกันทุกการเรียก (ไม่งั้น Ollama อาจโหลดโมเดลใหม่)"""
+    options = {"num_ctx": NUM_CTX}
+
+    if NUM_THREAD:
+        options["num_thread"] = NUM_THREAD
+
+    if NUM_GPU is not None:
+        options["num_gpu"] = NUM_GPU
+
+    return options
+
+
 def ollama_options(think):
     if think:
         temperature, top_p, num_predict = 0.6, 0.95, MAX_TOKENS_THINK
@@ -278,10 +355,10 @@ def ollama_options(think):
         temperature, top_p, num_predict = 0.7, 0.8, MAX_TOKENS_FAST
 
     return {
+        **base_options(),
         "temperature": temperature,
         "top_p": top_p,
         "top_k": 20,
-        "num_ctx": NUM_CTX,
         "num_predict": num_predict,
     }
 
@@ -294,10 +371,10 @@ def ollama_quick(messages, num_predict=60):
             "messages": messages,
             "stream": False,
             "think": False,
-            "keep_alive": "10m",
+            "keep_alive": KEEP_ALIVE,
             "options": {
+                **base_options(),
                 "temperature": 0.2,
-                "num_ctx": NUM_CTX,
                 "num_predict": num_predict,
             },
         },
@@ -308,15 +385,20 @@ def ollama_quick(messages, num_predict=60):
     return strip_think((data.get("message") or {}).get("content"))
 
 
-def ollama_stream(messages, think):
+def ollama_stream(messages, think, model=None):
+    model = model or MODEL
+
     payload = {
-        "model": MODEL,
+        "model": model,
         "messages": messages,
         "stream": True,
-        "think": think,
-        "keep_alive": "10m",
+        "keep_alive": KEEP_ALIVE,
         "options": ollama_options(think),
     }
+
+    # โมเดลสำรองอาจไม่รองรับโหมดคิด จึงส่ง think เฉพาะโมเดลหลักหรือเมื่อผู้ใช้เปิดคิดลึก
+    if model == MODEL or think:
+        payload["think"] = think
 
     with requests.post(
         f"{OLLAMA_URL}/api/chat",
@@ -324,7 +406,18 @@ def ollama_stream(messages, think):
         timeout=(10, 300),
         stream=True,
     ) as response:
-        response.raise_for_status()
+        # อ่านสาเหตุจริงที่ Ollama ส่งมา (เช่น out of memory) ก่อนโยนข้อผิดพลาด
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("error", "")
+            except Exception:
+                detail = response.text[:300]
+
+            error = requests.exceptions.HTTPError(
+                f"{response.status_code} {detail}", response=response
+            )
+            error.detail = f"{response.status_code}: {detail}"
+            raise error
 
         for line in response.iter_lines(decode_unicode=True):
             if not line:
@@ -348,23 +441,61 @@ def ollama_stream(messages, think):
                 break
 
 
+def embed_payload(texts):
+    payload = {
+        "model": EMBED_MODEL,
+        "input": texts,
+        "keep_alive": KEEP_ALIVE,
+    }
+
+    if EMBED_ON_CPU:
+        payload["options"] = {"num_gpu": 0}
+
+    return payload
+
+
 def embed(texts):
     vectors = []
 
     for start in range(0, len(texts), 32):
         response = requests.post(
             f"{OLLAMA_URL}/api/embed",
-            json={
-                "model": EMBED_MODEL,
-                "input": texts[start:start + 32],
-                "keep_alive": "10m",
-            },
+            json=embed_payload(texts[start:start + 32]),
             timeout=(10, 120),
         )
         response.raise_for_status()
         vectors.extend(response.json()["embeddings"])
 
     return vectors
+
+
+def warm_up():
+    """โหลดโมเดลเข้าหน่วยความจำล่วงหน้า (ทำเบื้องหลังตอนเปิดแอป) คำถามแรกจะไม่ต้องรอโหลด"""
+    try:
+        requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": MODEL,
+                "prompt": "",
+                "stream": False,
+                "keep_alive": KEEP_ALIVE,
+                "options": base_options(),
+            },
+            timeout=300,
+        ).raise_for_status()
+        print(f"[Local AI] โหลดโมเดล {MODEL} ล่วงหน้าเสร็จแล้ว")
+    except Exception as e:
+        print(f"[Local AI] โหลดโมเดลล่วงหน้าไม่สำเร็จ ({type(e).__name__}) จะโหลดตอนถามครั้งแรกแทน")
+        return
+
+    try:
+        requests.post(
+            f"{OLLAMA_URL}/api/embed",
+            json=embed_payload(["warm up"]),
+            timeout=120,
+        ).raise_for_status()
+    except Exception as e:
+        print(f"[Local AI] โหลด {EMBED_MODEL} ล่วงหน้าไม่สำเร็จ ({type(e).__name__})")
 
 
 def error_message(exc, is_en):
@@ -383,13 +514,18 @@ def error_message(exc, is_en):
         )
 
     if isinstance(exc, requests.exceptions.HTTPError):
-        print(f"[Local AI] HTTP error: {exc}")
+        detail = getattr(exc, "detail", "") or str(exc)
+        print(f"[Local AI] HTTP error: {detail}")
         return (
-            f"Ollama returned an API error. Check that '{MODEL}' and "
-            f"'{EMBED_MODEL}' are installed (ollama pull ...)."
+            f"Ollama returned an API error.\n\n**Reason from Ollama:** {detail}\n\n"
+            f"Check that '{MODEL}' and '{EMBED_MODEL}' are installed "
+            "(`ollama list`), Ollama is up to date, and NUM_CTX is not too "
+            "large for your RAM/VRAM."
             if is_en
-            else f"Ollama ตอบกลับด้วยข้อผิดพลาด ตรวจสอบว่าติดตั้งโมเดล "
-                 f"'{MODEL}' และ '{EMBED_MODEL}' แล้ว (ollama pull ...)"
+            else f"Ollama ตอบกลับด้วยข้อผิดพลาด\n\n**สาเหตุจาก Ollama:** {detail}\n\n"
+                 f"ตรวจว่าติดตั้งโมเดล '{MODEL}' และ '{EMBED_MODEL}' แล้ว "
+                 "(`ollama list`) อัปเดต Ollama เป็นรุ่นล่าสุด "
+                 "และ NUM_CTX ไม่ใหญ่เกินสำหรับ RAM/VRAM ของเครื่อง"
         )
 
     print(f"[Local AI] {type(exc).__name__}: {exc}")
@@ -625,6 +761,10 @@ def fetch_page_text(url):
 
 
 def make_search_query(message, history):
+    # คำถามสั้นและยังไม่มีบริบทก่อนหน้า ใช้ค้นตรงๆ ได้เลย ประหยัดเวลาเรียกโมเดลอีกรอบ
+    if not history and len(message) <= 40:
+        return message
+
     today = datetime.now().strftime("%Y-%m-%d")
 
     recent = []
@@ -774,7 +914,7 @@ How to use the reference material:
 
 
 # =========================================================
-# 4.5 ไฟล์ที่ผู้ใช้แนบในแชต
+# 4.5 ไฟล์และรูปที่ผู้ใช้แนบ / วาง (Ctrl+V) ในแชต
 # =========================================================
 
 def chunk_file(text, size=FILE_CHUNK_CHARS):
@@ -838,9 +978,44 @@ def read_uploaded_file(path):
     return raw.decode("utf-8", errors="ignore")
 
 
+def load_image_b64(path):
+    """ย่อรูปไม่ให้ใหญ่เกินไป (ประหยัดเวลา/หน่วยความจำ) แล้วแปลงเป็น base64"""
+    from PIL import Image
+
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        image.thumbnail((IMAGE_MAX_SIDE, IMAGE_MAX_SIDE))
+
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=90)
+
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def unique_name(name, taken):
+    """รูปที่วางจากคลิปบอร์ดมักชื่อ image.png ซ้ำกัน จึงต่อเลขท้ายให้ไม่ซ้ำ"""
+    if name not in taken:
+        return name
+
+    stem, suffix = Path(name).stem, Path(name).suffix
+    n = 2
+
+    while f"{stem} ({n}){suffix}" in taken:
+        n += 1
+
+    return f"{stem} ({n}){suffix}"
+
+
 def file_panel(files, notes):
-    """ข้อความรายการไฟล์แนบ + ปุ่มล้างไฟล์"""
-    lines = [f"📎 **{f['name']}** · {len(f['text']):,} ตัวอักษร" for f in files]
+    """ข้อความรายการสิ่งที่แนบ + ปุ่มล้าง"""
+    lines = []
+
+    for f in files:
+        if f.get("kind") == "image":
+            lines.append(f"🖼️ **{f['name']}**")
+        else:
+            lines.append(f"📎 **{f['name']}** · {len(f['text']):,} ตัวอักษร")
+
     lines += notes
 
     return (
@@ -849,17 +1024,17 @@ def file_panel(files, notes):
     )
 
 
-def attach_files(uploaded, current):
+def add_attachments(paths, current):
+    """เพิ่มไฟล์/รูปที่แนบหรือวางเข้ารายการ คืนค่า (รายการใหม่, ข้อความเตือน)"""
     files = list(current or [])
     notes = []
+
+    hashes = {f.get("hash") for f in files}
     names = {f["name"] for f in files}
+    n_images = sum(1 for f in files if f.get("kind") == "image")
+    n_docs = len(files) - n_images
 
-    if uploaded is None:
-        uploaded = []
-    elif not isinstance(uploaded, list):
-        uploaded = [uploaded]
-
-    for item in uploaded:
+    for item in paths or []:
         if isinstance(item, str):
             raw_path = item
         elif isinstance(item, dict):
@@ -872,16 +1047,10 @@ def attach_files(uploaded, current):
 
         path = Path(raw_path)
         name = path.name
+        suffix = path.suffix.lower()
+        image = suffix in IMAGE_TYPES
 
-        if len(files) >= MAX_FILES:
-            notes.append(f"⚠️ แนบได้สูงสุด {MAX_FILES} ไฟล์ ข้าม: {name}")
-            continue
-
-        if name in names:
-            notes.append(f"⚠️ มีไฟล์ {name} อยู่แล้ว")
-            continue
-
-        if path.suffix.lower() not in FILE_TYPES:
+        if not image and suffix not in FILE_TYPES:
             notes.append(f"⚠️ ไม่รองรับไฟล์ชนิดนี้: {name}")
             continue
 
@@ -890,44 +1059,156 @@ def attach_files(uploaded, current):
                 notes.append(f"⚠️ {name} ใหญ่เกิน {MAX_FILE_MB} MB")
                 continue
 
-            text = read_uploaded_file(path).strip()
+            digest = hashlib.sha1(path.read_bytes()).hexdigest()
+
+            if digest in hashes:
+                notes.append(f"⚠️ {name} ถูกแนบไว้แล้ว")
+                continue
+
+            if image:
+                if n_images >= MAX_IMAGES:
+                    notes.append(f"⚠️ แนบรูปได้สูงสุด {MAX_IMAGES} รูป ข้าม: {name}")
+                    continue
+
+                name = unique_name(name, names)
+                files.append({
+                    "kind": "image",
+                    "name": name,
+                    "b64": load_image_b64(path),
+                    "hash": digest,
+                })
+                n_images += 1
+
+            else:
+                if n_docs >= MAX_FILES:
+                    notes.append(f"⚠️ แนบไฟล์ได้สูงสุด {MAX_FILES} ไฟล์ ข้าม: {name}")
+                    continue
+
+                text = read_uploaded_file(path).strip()
+
+                if not text:
+                    notes.append(
+                        f"⚠️ {name} ไม่มีข้อความให้อ่าน "
+                        "(ถ้าเป็น PDF สแกน ต้องทำ OCR ก่อน)"
+                    )
+                    continue
+
+                if len(text) > FILE_STORE_CHARS:
+                    notes.append(
+                        f"⚠️ {name} ยาวมาก จะอ่านเฉพาะ "
+                        f"{FILE_STORE_CHARS:,} ตัวอักษรแรก"
+                    )
+
+                name = unique_name(name, names)
+                files.append({
+                    "kind": "doc",
+                    "name": name,
+                    "text": text[:FILE_STORE_CHARS],
+                    "chunks": None,      # สร้างตอนต้องใช้
+                    "vectors": None,
+                    "hash": digest,
+                })
+                n_docs += 1
 
         except ImportError:
-            notes.append(f"⚠️ อ่าน {name} ไม่ได้ ต้องติดตั้ง: pip install python-docx")
+            notes.append(
+                f"⚠️ อ่าน {name} ไม่ได้ ต้องติดตั้งแพ็กเกจเพิ่ม "
+                "(.docx: pip install python-docx)"
+            )
             continue
         except Exception as e:
             print(f"[Local AI] read {name}: {type(e).__name__}: {e}")
             notes.append(f"⚠️ อ่าน {name} ไม่ได้ ({type(e).__name__})")
             continue
 
-        if not text:
-            notes.append(
-                f"⚠️ {name} ไม่มีข้อความให้อ่าน (ถ้าเป็น PDF สแกน ต้องทำ OCR ก่อน)"
-            )
-            continue
-
-        if len(text) > FILE_STORE_CHARS:
-            notes.append(
-                f"⚠️ {name} ยาวมาก จะอ่านเฉพาะ {FILE_STORE_CHARS:,} ตัวอักษรแรก"
-            )
-
-        files.append({
-            "name": name,
-            "text": text[:FILE_STORE_CHARS],
-            "chunks": None,      # สร้างตอนต้องใช้
-            "vectors": None,
-        })
+        hashes.add(digest)
         names.add(name)
 
+    return files, notes
+
+
+def ingest(value, current):
+    """รับไฟล์/รูปจากช่องพิมพ์ (แนบหรือกด Ctrl+V) เก็บเข้ารายการ แล้วเหลือไว้แต่ข้อความ"""
+    value = value if isinstance(value, dict) else {"text": value or "", "files": []}
+    paths = value.get("files") or []
+
+    if not paths:
+        return current or [], gr.update(), gr.update(), gr.update()
+
+    files, notes = add_attachments(paths, current)
     info, clear = file_panel(files, notes)
 
-    # คืนค่า None ให้ปุ่มแนบ เพื่อให้เลือกไฟล์เดิมซ้ำได้อีก
-    return files, info, clear, gr.update(value=None)
+    return files, info, clear, {"text": value.get("text") or "", "files": []}
 
 
 def clear_files():
     return [], gr.update(value="", visible=False), gr.update(visible=False)
 
+
+# ---------- โมเดลที่อ่านรูปได้ ----------
+
+_vision_cache = {}
+
+
+def has_vision(model):
+    if model in _vision_cache:
+        return _vision_cache[model]
+
+    try:
+        response = requests.post(
+            f"{OLLAMA_URL}/api/show", json={"model": model}, timeout=10
+        )
+        response.raise_for_status()
+        capabilities = response.json().get("capabilities")
+
+        # Ollama รุ่นเก่าไม่บอก capabilities -> ลองส่งรูปไปเลย
+        ok = True if capabilities is None else ("vision" in capabilities)
+
+    except requests.exceptions.HTTPError:
+        ok = False                     # ไม่มีโมเดลนี้ในเครื่อง
+
+    _vision_cache[model] = ok
+    return ok
+
+
+def pick_vision_model():
+    for name in (MODEL, VISION_MODEL):
+        if name and has_vision(name):
+            return name
+
+    return ""
+
+
+def no_vision_message(is_en):
+    if is_en:
+        return (
+            f"The model '{MODEL}' cannot read images. Install a vision model "
+            "(e.g. `ollama pull qwen2.5vl:7b`) and set its name in VISION_MODEL "
+            "in app.py, or press 'Clear files' to ask with text only."
+        )
+
+    return (
+        f"โมเดล '{MODEL}' อ่านรูปภาพไม่ได้ ให้ติดตั้งโมเดลที่รองรับรูป "
+        "(เช่น `ollama pull qwen2.5vl:7b`) แล้วใส่ชื่อไว้ที่ VISION_MODEL ใน app.py "
+        "หรือกด ✖ ล้างไฟล์ เพื่อถามเฉพาะข้อความ"
+    )
+
+
+def image_instruction(is_en):
+    if is_en:
+        return (
+            "\n\nThe user attached image(s). Look at them and answer from what "
+            "is actually visible. Never guess things that are not in the image; "
+            "if something is unclear, say so.\n"
+        )
+
+    return (
+        "\n\nผู้ใช้แนบรูปภาพมาด้วย ให้ดูรูปแล้วตอบตามที่เห็นจริง "
+        "ห้ามเดาสิ่งที่ไม่ปรากฏในรูป ถ้าเห็นไม่ชัดให้บอกตรงๆ\n"
+    )
+
+
+# ---------- ไฟล์เอกสาร: ส่งทั้งไฟล์ หรือเลือกเฉพาะส่วนที่ตรงคำถาม ----------
 
 def build_file_context(files, query):
     """คืนค่า (ข้อความไฟล์สำหรับส่งให้โมเดล, เป็นแค่บางส่วนหรือไม่)
@@ -1019,6 +1300,8 @@ def chat(message, history, language, use_search, use_kb, deep_think, files=None)
     message = (message or "").strip()
     history = history or []
     files = files or []
+    docs = [f for f in files if f.get("kind", "doc") == "doc"]
+    images = [f for f in files if f.get("kind") == "image"]
 
     if language not in PROMPTS:
         language = LANG_THAI
@@ -1086,15 +1369,15 @@ def chat(message, history, language, use_search, use_kb, deep_think, files=None)
         # ไฟล์ที่แนบมา
         file_context, file_partial = "", False
 
-        if files:
-            if sum(len(f["text"]) for f in files) > FILE_FULL_CHARS:
+        if docs:
+            if sum(len(f["text"]) for f in docs) > FILE_FULL_CHARS:
                 yield (
                     "📎 Reading your files..."
                     if ui_is_en
                     else "📎 กำลังอ่านไฟล์ที่แนบ..."
                 )
 
-            file_context, file_partial = build_file_context(files, base_query)
+            file_context, file_partial = build_file_context(docs, base_query)
 
         # ถ้ามีไฟล์แนบ ไม่ต้องบอกว่า "ตอบจากความรู้ของโมเดลเอง" เพียงเพราะค้นเว็บ/ฐานความรู้ไม่เจอ
         asked = bool(use_kb or use_search) and (bool(sources) or not files)
@@ -1110,11 +1393,23 @@ def chat(message, history, language, use_search, use_kb, deep_think, files=None)
                 "\n\n".join(context_parts), work_is_en
             )
 
+        # มีรูปแนบ -> ต้องใช้โมเดลที่อ่านรูปได้
+        chat_model = MODEL
+
+        if images:
+            chat_model = pick_vision_model()
+
+            if not chat_model:
+                yield no_vision_message(ui_is_en)
+                return
+
+            system_prompt += image_instruction(work_is_en)
+
         messages = [{"role": "system", "content": system_prompt}]
 
         # มีไฟล์แนบ -> ลดประวัติลง เพื่อเหลือที่ว่างให้เนื้อหาไฟล์
-        history_n = 6 if files else HISTORY_MESSAGES
-        history_chars = 1500 if files else HISTORY_CHARS
+        history_n = min(4, HISTORY_MESSAGES) if files else HISTORY_MESSAGES
+        history_chars = min(1000, HISTORY_CHARS) if files else HISTORY_CHARS
 
         for item in history[-history_n:]:
             if not isinstance(item, dict):
@@ -1130,19 +1425,32 @@ def chat(message, history, language, use_search, use_kb, deep_think, files=None)
                     "content": content[-history_chars:],
                 })
 
-        messages.append({"role": "user", "content": message})
+        user_message = {"role": "user", "content": message}
+
+        if images:
+            user_message["images"] = [im["b64"] for im in images]
+
+        messages.append(user_message)
 
         yield "🧠 Thinking..." if ui_is_en else "🧠 กำลังคิดคำตอบ..."
 
         answer = ""
         reason = ""
+        last_push = 0.0
 
-        for kind, piece in ollama_stream(messages, think=bool(deep_think)):
+        for kind, piece in ollama_stream(
+            messages, think=bool(deep_think), model=chat_model
+        ):
             if kind == "content":
                 answer += piece
-                visible = strip_think(answer)
-                if visible:
-                    yield visible
+
+                # อัปเดตหน้าจอเป็นช่วงๆ ไม่ใช่ทุก token (ลดภาระ ทำให้ลื่นขึ้น)
+                now = time.perf_counter()
+                if now - last_push >= STREAM_INTERVAL:
+                    visible = strip_think(answer)
+                    if visible:
+                        yield visible
+                        last_push = now
 
             elif kind == "done":
                 reason = piece
@@ -1189,347 +1497,266 @@ def chat(message, history, language, use_search, use_kb, deep_think, files=None)
 
 
 # =========================================================
-# 6. ธีมและ CSS (สไตล์ขาว-เทา ตัวอักษรใหญ่ ปุ่มดำทรงแคปซูล)
+# 6. ธีมและ CSS (ดีไซน์การ์ดสไตล์ Bento บนพื้นหลังกลางคืน)
 # =========================================================
-
-INK = "#f2f2f2"          # สีตัวอักษรหลัก (ขาว)
-PAPER = "#1d1e23"        # พื้นหลัง
-CARD = "#25262c"
-LINE = "#3a3c44"
 
 THEME = gr.themes.Base(
     primary_hue="neutral",
-    neutral_hue="gray",
-    radius_size=gr.themes.sizes.radius_xxl,
-    font=["Plus Jakarta Sans", "Prompt", "Segoe UI", "sans-serif"],
+    neutral_hue="zinc",
+    radius_size=gr.themes.sizes.radius_md,
+    font=["Prompt", "Segoe UI", "sans-serif"],
 ).set(
-    body_background_fill=PAPER,
-    body_background_fill_dark=PAPER,
-    body_text_color=INK,
-    body_text_color_dark=INK,
+    body_background_fill="#060709",
+    body_background_fill_dark="#060709",
+    body_text_color="#e9e9ea",
+    body_text_color_dark="#e9e9ea",
     block_background_fill="transparent",
     block_background_fill_dark="transparent",
     block_border_width="0px",
-    block_label_text_color=INK,
-    block_label_text_color_dark=INK,
-    block_title_text_color=INK,
-    block_title_text_color_dark=INK,
-    background_fill_primary=CARD,
-    background_fill_primary_dark=CARD,
-    background_fill_secondary=PAPER,
-    background_fill_secondary_dark=PAPER,
-    input_background_fill="#2c2d34",
-    input_background_fill_dark="#2c2d34",
-    input_border_color=LINE,
-    input_border_color_dark=LINE,
-    button_primary_background_fill="#f2f2f2",
-    button_primary_background_fill_dark="#f2f2f2",
-    button_primary_background_fill_hover="#ffffff",
-    button_primary_background_fill_hover_dark="#ffffff",
-    button_primary_text_color="#111111",
-    button_primary_text_color_dark="#111111",
-    button_secondary_background_fill="#2c2d34",
-    button_secondary_background_fill_dark="#2c2d34",
-    button_secondary_text_color=INK,
-    button_secondary_text_color_dark=INK,
+    input_background_fill="#2a2d33",
+    input_background_fill_dark="#2a2d33",
+    input_border_color="#3a3e46",
+    input_border_color_dark="#3a3e46",
+    button_primary_background_fill="#15161a",
+    button_primary_background_fill_dark="#15161a",
+    button_primary_background_fill_hover="#2a2c31",
+    button_primary_background_fill_hover_dark="#2a2c31",
+    button_primary_text_color="#ffffff",
+    button_primary_text_color_dark="#ffffff",
 )
 
 
 CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=Prompt:wght@200;300;400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;500;600&display=swap');
 
-:root { color-scheme: dark; --ink:#f2f2f2; --line:#3a3c44; --gray:#8b8d96; }
-
-html, body, gradio-app {
-    margin: 0 !important; min-height: 100vh;
-    background:
-        radial-gradient(900px 600px at 50% 18%, #3b3e47 0%, rgba(59,62,71,0) 70%),
-        linear-gradient(180deg, #2a2c33 0%, #1b1c20 100%) fixed !important;
-    background-color: #1b1c20 !important;
-}
-
+/* ---------- พื้นหลังท้องฟ้ากลางคืน ---------- */
 .gradio-container {
-    max-width: none !important; width: 100% !important;
-    margin: 0 !important; padding: 8px 40px 18px !important;
-    color: var(--ink) !important;
-    background: transparent !important;
+    max-width: 100% !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 22px !important;
     min-height: 100vh;
+    background:
+        radial-gradient(1.6px 1.6px at 8% 12%,  rgba(255,255,255,.9) 50%, transparent 52%),
+        radial-gradient(1.2px 1.2px at 22% 7%,  rgba(255,255,255,.7) 50%, transparent 52%),
+        radial-gradient(1.4px 1.4px at 37% 15%, rgba(255,255,255,.8) 50%, transparent 52%),
+        radial-gradient(1.1px 1.1px at 55% 6%,  rgba(255,255,255,.7) 50%, transparent 52%),
+        radial-gradient(1.6px 1.6px at 71% 13%, rgba(255,255,255,.9) 50%, transparent 52%),
+        radial-gradient(1.2px 1.2px at 86% 8%,  rgba(255,255,255,.7) 50%, transparent 52%),
+        radial-gradient(1.3px 1.3px at 93% 22%, rgba(255,255,255,.8) 50%, transparent 52%),
+        radial-gradient(1.1px 1.1px at 4% 30%,  rgba(255,255,255,.6) 50%, transparent 52%),
+        radial-gradient(ellipse 85% 35% at 50% 115%, #34353c 0%, transparent 70%),
+        linear-gradient(180deg, #060709 0%, #0f1015 100%) !important;
 }
 footer { display: none !important; }
 
-* { scrollbar-width: thin; scrollbar-color: #4a4c55 transparent; }
+* { scrollbar-width: thin; scrollbar-color: #8a8d94 transparent; }
 *::-webkit-scrollbar { width: 8px; height: 8px; }
-*::-webkit-scrollbar-thumb { background: #4a4c55; border-radius: 8px; }
+*::-webkit-scrollbar-thumb { background: #8a8d94; border-radius: 8px; }
 *::-webkit-scrollbar-track { background: transparent; }
 
-/* ---------------- แถบบน ---------------- */
-#topbar {
-    display: grid; grid-template-columns: 1fr auto 1fr;
-    align-items: center; padding: 14px 4px 10px; position: relative; z-index: 5;
-}
-#topbar .brand {
-    display: flex; align-items: center; gap: 12px;
-    font-weight: 400; letter-spacing: .3em; font-size: 12px; color: #d8d8d8;
-}
-#topbar .logo {
-    width: 30px; height: 30px; background: transparent; color: #fff;
-    display: inline-flex; align-items: center; justify-content: center;
-    font-weight: 300; font-size: 24px; letter-spacing: 0;
-}
-#topbar .navpill {
-    justify-self: center; display: inline-flex; align-items: center; gap: 6px;
-    padding: 4px 6px; border-radius: 999px; font-size: 10px; color: #7d7f88;
-    letter-spacing: .22em; text-transform: uppercase;
-    background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.07);
-}
-#topbar .navpill .item {
-    display: inline-flex; align-items: center; gap: 8px;
-    padding: 6px 14px; border-radius: 999px; position: relative;
-}
-#topbar .navpill .item.active { color: #fff; font-weight: 600; }
-#topbar .navpill .item.active i {
-    position: absolute; left: 50%; bottom: -4px; width: 4px; height: 4px;
-    margin-left: -2px; border-radius: 50%; background: #fff;
-}
-#topbar .navpill .dot {
-    width: 7px; height: 7px; border-radius: 50%; background: #22c55e;
-    box-shadow: 0 0 0 3px rgba(34,197,94,.2);
-}
-#topbar .cta {
-    justify-self: end; display: inline-flex; align-items: center; gap: 12px;
-    background: transparent; color: #cfcfcf; border: 1px solid rgba(255,255,255,.14);
-    border-radius: 999px; padding: 5px 5px 5px 18px; font-size: 10px;
-    letter-spacing: .22em; text-transform: uppercase; font-weight: 600;
-}
-#topbar .cta .arr {
-    width: 26px; height: 26px; border-radius: 50%; background: #f2f2f2; color: #111;
-    display: inline-flex; align-items: center; justify-content: center; font-size: 12px;
+/* ---------- กรอบอุปกรณ์ ---------- */
+#app-grid {
+    display: flex !important; flex-wrap: nowrap !important; align-items: stretch;
+    gap: 16px !important;
+    max-width: 1500px; margin: 0 auto !important;
+    height: calc(100vh - 44px); min-height: 560px;
+    padding: 16px !important;
+    background: #0d0e11 !important;
+    border: 2px solid #3b3d44 !important;
+    border-radius: 40px !important;
+    box-shadow: 0 0 0 6px #17181c, 0 40px 90px rgba(0,0,0,.65) !important;
 }
 
-/* ---------------- หน้าแรก ---------------- */
-#intro { gap: 0 !important; }
+#side, #main, #right, #settings-card, #side-pill { flex-wrap: nowrap !important; }
 
-#hero {
-    position: relative; text-align: center;
-    min-height: 440px; padding: 270px 6px 0;
+/* ---------- คอลัมน์ซ้าย: โลโก้ + แถบเมนู ---------- */
+#side {
+    flex: 0 0 84px !important; min-width: 84px !important; max-width: 84px;
+    gap: 14px !important;
 }
-
-/* โคมไฟ */
-#lamp {
-    position: absolute; left: 50%; top: -60px; width: 340px; height: 330px;
-    margin-left: -170px; pointer-events: none;
+#side-pill {
+    flex: 1 1 auto;
+    background: #f3f3f1 !important;
+    border-radius: 44px !important;
+    padding: 18px 0 !important;
+    display: flex !important; flex-direction: column !important;
+    align-items: center; justify-content: space-between;
+    gap: 0 !important;
 }
-#lamp .cord {
-    position: absolute; left: 50%; top: 0; width: 2px; height: 130px;
-    margin-left: -1px; background: linear-gradient(180deg, #111, #555);
-}
-#lamp .shade {
-    position: absolute; left: 50%; top: 128px; width: 150px; height: 48px;
-    margin-left: -75px;
-    background: linear-gradient(180deg, #4a4c54 0%, #17181b 100%);
-    clip-path: polygon(34% 0, 66% 0, 100% 100%, 0 100%);
-    border-radius: 6px 6px 0 0;
-}
-#lamp .bulb {
-    position: absolute; left: 50%; top: 168px; width: 18px; height: 18px;
-    margin-left: -9px; border-radius: 50%; background: #fff; z-index: 2;
-    box-shadow: 0 0 18px 6px rgba(255,255,255,.75), 0 0 70px 24px rgba(255,255,255,.28);
-    animation: flicker 6s ease-in-out infinite;
-}
-#lamp .cone {
-    position: absolute; left: 50%; top: 172px; width: 330px; height: 250px;
-    margin-left: -165px;
-    background: linear-gradient(180deg, rgba(255,255,255,.30) 0%, rgba(255,255,255,0) 100%);
-    clip-path: polygon(42% 0, 58% 0, 100% 100%, 0 100%);
-    filter: blur(6px);
-}
-@keyframes flicker {
-    0%, 100% { opacity: 1; } 48% { opacity: 1; } 50% { opacity: .85; } 52% { opacity: 1; }
+#new-btn, #new-btn button {
+    width: 48px !important; min-width: 48px !important; height: 48px !important;
+    padding: 0 !important; border: none !important; border-radius: 50% !important;
+    background: #15161a !important; color: #fff !important;
+    font-size: 22px !important; line-height: 1 !important;
 }
 
-#hero .ghost {
-    position: absolute; left: 0; right: 0; top: 120px; text-align: center;
-    font-size: clamp(70px, 13vw, 190px); font-weight: 800; letter-spacing: .22em;
-    color: rgba(255,255,255,.05); white-space: nowrap; pointer-events: none;
-    padding-left: .22em;
+/* ---------- การ์ดหลักตรงกลาง ---------- */
+#main {
+    flex: 1 1 0 !important; min-width: 0 !important;
+    gap: 12px !important; padding: 18px !important;
+    border-radius: 34px !important; overflow: hidden;
+    background: linear-gradient(160deg, #e6e7ea 0%, #c2c4c9 55%, #a4a7ad 100%) !important;
+    color: #15161a;
 }
-#hero .eyebrow {
-    position: relative; display: inline-block; font-size: 10px; letter-spacing: .3em;
-    color: #8b8d96; margin-bottom: 14px;
+#cards-box { flex: 1 1 0 !important; min-height: 0; background: transparent !important; border: none !important; }
+
+/* ---------- กล่องแชต (ซ้าย-ขวาสไตล์เดียวกัน ขาว/ดำ) ---------- */
+#chatbot,
+#chatbot .bubble-wrap,
+#chatbot .wrapper,
+#chatbot .message-wrap,
+#chatbot .message-row {
+    background: transparent !important;
+    border: none !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
 }
-#hero h1 {
-    position: relative; font-weight: 300; font-size: clamp(22px, 2.6vw, 40px);
-    line-height: 1.3; letter-spacing: .22em; margin: 0 0 12px; color: #e8e8e8;
+#chatbot { height: calc(100vh - 275px) !important; min-height: 280px; }
+#chatbot .bubble-wrap { padding: 6px 6px !important; }
+#chatbot .message { font-size: 15px !important; line-height: 1.75 !important; }
+/* บับเบิลชั้นนอก (อย่าใช้ max-width เป็น % เพราะพ่อแม่ขนาดตามเนื้อหา จะหดจนข้อความขึ้นบรรทัดละคำ) */
+#chatbot .message.user, #chatbot .message.bot {
+    padding: 10px 16px !important;
+    max-width: 760px !important;
+    border: none !important; box-shadow: none !important;
 }
-#hero h1 br { display: none; }
-#hero h1 .g { color: #7d7f88; }
-#hero .dash { display: none; }
-#hero p {
-    position: relative; color: #7d7f88; font-size: 12px; letter-spacing: .08em;
-    line-height: 1.9; max-width: 460px; margin: 0 auto;
+/* ชั้นใน (ตัวเนื้อหา) ไม่ต้องมีกรอบหรือระยะเพิ่ม */
+#chatbot .message:not(.user):not(.bot) {
+    padding: 0 !important; max-width: none !important; width: auto !important;
+    background: transparent !important; border: none !important; box-shadow: none !important;
+}
+#chatbot .message.user, #chatbot [data-testid="user"] {
+    background: #15161a !important;
+    border-radius: 22px 22px 6px 22px !important;
+}
+#chatbot .message.user, #chatbot .message.user * { color: #ffffff !important; }
+#chatbot .message.bot, #chatbot [data-testid="bot"] {
+    background: #ffffff !important;
+    border-radius: 22px 22px 22px 6px !important;
+}
+#chatbot .message.bot, #chatbot .message.bot * { color: #15161a !important; }
+#chatbot .message p { margin: 0 0 .6em; }
+#chatbot .message p:last-child { margin-bottom: 0; }
+#chatbot pre {
+    background: #f0f0ee !important; border: none !important;
+    border-radius: 14px !important; padding: 12px 14px !important;
+}
+#chatbot .message.bot a { color: #b4530a !important; }
+#chatbot .icon-button-wrapper, #chatbot .icon-buttons {
+    background: transparent !important; border: none !important; box-shadow: none !important;
+}
+/* ปุ่มคัดลอก / แชร์ / ลบ ให้เห็นชัด: แคปซูลขาว ไอคอนดำ */
+#chatbot button {
+    background: #ffffff !important; color: #15161a !important;
+    border: 1px solid rgba(21,22,26,.22) !important;
+    border-radius: 10px !important; opacity: 1 !important;
+    box-shadow: 0 2px 6px rgba(0,0,0,.10) !important;
+}
+#chatbot button:hover { background: #15161a !important; }
+#chatbot button:hover, #chatbot button:hover * { color: #ffffff !important; }
+#chatbot button svg, #chatbot button svg * { color: #15161a !important; }
+#chatbot button:hover svg, #chatbot button:hover svg * { color: #ffffff !important; }
+
+/* ---------- ไฟล์แนบ ---------- */
+#attach-info, #attach-info * { color: #33363d !important; font-size: 12px; }
+#attach-info p { margin: 0; }
+#clear-btn {
+    background: #15161a !important; color: #fff !important;
+    border: none !important; border-radius: 999px !important;
 }
 
-#start-btn {
-    width: auto !important; flex-grow: 0 !important; align-self: center;
-    background: transparent !important; color: #e8e8e8 !important;
-    border: 1px solid rgba(255,255,255,.25) !important;
-    border-radius: 999px !important; padding: 12px 34px !important;
-    font-weight: 500 !important; font-size: 12px !important; letter-spacing: .2em;
-    margin: 18px auto 0;
+/* ---------- ช่องพิมพ์ (แคปซูลสีขาว เหมือน Write your prompt) ---------- */
+#input-row {
+    background: #ffffff !important; border: none !important;
+    border-radius: 999px !important; padding: 6px 8px !important;
+    box-shadow: 0 8px 26px rgba(0,0,0,.14) !important;
 }
-#start-btn:hover { background: rgba(255,255,255,.1) !important; }
-
-/* การ์ดด้านล่าง 01. 02. 03. */
-#strip {
+#input-row > div, #input-row .wrapper {
     background: transparent !important; border: none !important;
-    border-radius: 0 !important; padding: 0 !important; gap: 0 !important;
-    margin-top: 28px; counter-reset: pc;
+    border-radius: 999px !important; box-shadow: none !important;
 }
-#strip button.pcard, .pcard {
-    counter-increment: pc; position: relative;
-    background: rgba(255,255,255,.035) !important;
-    border: none !important; border-right: 1px solid rgba(255,255,255,.04) !important;
-    border-radius: 0 !important; color: #6f717a !important; box-shadow: none !important;
-    padding: 22px 18px 22px 96px !important; min-height: 92px;
-    text-align: left !important; white-space: pre-line !important;
-    font-size: 11px !important; font-weight: 400 !important; line-height: 1.7 !important;
-    transition: background .2s;
+#input-row textarea {
+    background: transparent !important; color: #15161a !important;
+    border-radius: 999px !important; padding: 12px 14px !important;
+}
+#input-row textarea::placeholder { color: #8b8e96 !important; }
+#input-row button { background: #15161a !important; border-radius: 50% !important; }
+#input-row button, #input-row button * { color: #ffffff !important; }
+
+/* ---------- คอลัมน์ขวา ---------- */
+#right {
+    flex: 0 0 310px !important; min-width: 260px !important; max-width: 310px;
+    gap: 12px !important;
+}
+
+/* การ์ดหัวข้อ 01 / 02 / 03 */
+.pcard, button.pcard {
+    flex: 1 1 0 !important; min-height: 96px;
+    display: flex !important; flex-direction: column !important;
+    align-items: flex-start !important; justify-content: flex-start !important;
+    padding: 16px 20px !important;
+    border: none !important; border-radius: 28px !important;
+    color: #ffffff !important; text-align: left !important;
+    white-space: normal !important;
+    font-size: 14px !important; font-weight: 600 !important;
+    box-shadow: none !important;
+    transition: transform .15s, filter .15s;
 }
 .pcard::before {
-    content: counter(pc, decimal-leading-zero) ".";
-    position: absolute; left: 22px; top: 50%; transform: translateY(-50%);
-    font-size: 34px; font-weight: 200; color: #8b8d96; letter-spacing: .04em;
+    font-size: 11px; font-weight: 500; letter-spacing: .08em;
+    padding: 4px 11px; margin-bottom: 10px;
+    border: 1px solid rgba(255,255,255,.55); border-radius: 999px;
 }
-.pcard::first-line {
-    color: #e8e8e8; font-size: 11px; font-weight: 700; letter-spacing: .16em;
+.pcard::after {
+    font-size: 11px; font-weight: 300; line-height: 1.55;
+    color: rgba(255,255,255,.72); margin-top: 4px;
 }
-.pcard:last-child { border-right: none !important; }
-.pcard:hover { background: rgba(255,255,255,.08) !important; }
+#pcard-1::before { content: "01"; }
+#pcard-2::before { content: "02"; }
+#pcard-3::before { content: "03"; }
+#pcard-1::after { content: "เข้าใจ Machine Learning แบบง่ายๆ สำหรับผู้เริ่มต้น"; }
+#pcard-2::after { content: "เขียน Python อ่านไฟล์ CSV และสรุปข้อมูล"; }
+#pcard-3::after { content: "หลักการทำงานของแบตเตอรี่ลิเธียมไอออน"; }
+#pcard-1 { background: radial-gradient(circle at 88% 90%, rgba(255,122,26,.65), transparent 55%), linear-gradient(135deg, #3a3c42, #15161a) !important; }
+#pcard-2 { background: radial-gradient(circle at 88% 90%, rgba(235,235,235,.40), transparent 55%), linear-gradient(135deg, #2c2e33, #101114) !important; }
+#pcard-3 { background: radial-gradient(circle at 88% 90%, rgba(255,160,70,.50), transparent 55%), linear-gradient(135deg, #34363b, #131417) !important; }
+.pcard:hover { transform: translateY(-2px); filter: brightness(1.14); }
 
-/* ---------------- แชต ---------------- */
-#chatbot { height: calc(100vh - 250px) !important; min-height: 320px; }
-
-.gradio-container [class*="chatbot"], .gradio-container .chatbot {
-    background: transparent !important; border: none !important;
+/* การ์ดตั้งค่า (สีขาว ปุ่มแบบแคปซูล เหมือน Choose styles) */
+#settings-card {
+    background: #f3f3f1 !important;
+    border-radius: 30px !important;
+    padding: 16px 18px !important;
+    gap: 10px !important;
 }
-.message.user, [data-testid="user"] {
-    background: #f2f2f2 !important; color: #111 !important;
-    border-radius: 20px 20px 6px 20px !important;
-}
-.message.bot, [data-testid="bot"] {
-    background: rgba(255,255,255,.06) !important; color: #e8e8e8 !important;
-    border: 1px solid rgba(255,255,255,.1) !important;
-    border-radius: 20px 20px 20px 6px !important;
-    box-shadow: 0 8px 22px rgba(0,0,0,.25);
-}
-.message.user *, [data-testid="user"] * { color: #111 !important; }
-.message.bot *, [data-testid="bot"] * { color: #e8e8e8; }
-.message.bot a { color: #9ec5ff !important; }
-
-/* กันกล่องซ้อนกันในฟองแชต */
-[data-testid="bot"] [data-testid="bot"],
-[data-testid="bot"] .message.bot,
-.message.bot .message.bot,
-.message.bot [data-testid="bot"],
-[data-testid="user"] [data-testid="user"],
-[data-testid="user"] .message.user,
-.message.user .message.user,
-.message.user [data-testid="user"],
-.message.bot .prose, .message.bot .md, .message.bot span,
-.message.user .prose, .message.user .md, .message.user span {
-    background: transparent !important; border: none !important;
-    box-shadow: none !important; padding-top: 0 !important; padding-bottom: 0 !important;
-}
-.message.bot span, .message.user span { border-radius: 0 !important; }
-.message img.emoji, .message .md img, .message .prose img {
+#settings-card, #settings-card * { color: #15161a; }
+#settings-card .block, #settings-card .form {
     background: transparent !important; border: none !important;
     box-shadow: none !important; padding: 0 !important;
 }
-.message.bot pre, .message.bot code { background: rgba(0,0,0,.35) !important; }
-
-/* ปุ่มคัดลอก / แชร์ / ลบ */
-.message-buttons, .message-buttons-left, .message-buttons-right,
-.message-buttons-bubble, .message-buttons-panel {
-    background: transparent !important; border: none !important; box-shadow: none !important;
+#settings-card label {
+    display: inline-flex !important; align-items: center; gap: 6px;
+    background: transparent !important;
+    border: 1px solid #15161a !important; border-radius: 999px !important;
+    padding: 6px 12px !important; font-size: 11px !important; cursor: pointer;
 }
-.message-buttons button, .message-buttons .icon-button,
-button.icon-button, .copy-button, .message button[aria-label] {
-    background: transparent !important; border: none !important; box-shadow: none !important;
-    color: #9a9ca5 !important; border-radius: 8px !important; min-width: 0 !important;
+#settings-card label:has(input:checked) { background: #15161a !important; }
+#settings-card label:has(input:checked),
+#settings-card label:has(input:checked) * { color: #ffffff !important; }
+#settings-card input[type="checkbox"],
+#settings-card input[type="radio"] {
+    -webkit-appearance: none !important; appearance: none !important;
+    width: 0 !important; height: 0 !important; margin: 0 !important;
+    opacity: 0; position: absolute;
 }
-.message-buttons button:hover, button.icon-button:hover { background: rgba(255,255,255,.1) !important; }
-.message-buttons svg, button.icon-button svg, .copy-button svg {
-    stroke: currentColor !important; color: #9a9ca5 !important;
+#lang-radio .wrap {
+    display: flex !important; flex-wrap: wrap !important; gap: 8px !important;
+    background: transparent !important; border: none !important;
 }
-.icon-button-wrapper {
-    border: none !important; background: transparent !important; box-shadow: none !important;
-}
-
-/* ---------------- ช่องพิมพ์ ---------------- */
-#input-row { align-items: center; gap: 8px; margin-top: 10px; }
-#input-row textarea {
-    border-radius: 999px !important; padding: 13px 20px !important;
-    background: rgba(255,255,255,.07) !important; color: #f2f2f2 !important;
-    border: 1px solid rgba(255,255,255,.12) !important;
-}
-#input-row textarea::placeholder { color: #7d7f88 !important; }
-#attach-btn, #send-btn {
-    min-width: 48px !important; max-width: 52px; height: 48px;
-    border-radius: 50% !important; padding: 0 !important;
-}
-#send-btn { background: #f2f2f2 !important; color: #111 !important; }
-#attach-btn {
-    background: rgba(255,255,255,.07) !important;
-    border: 1px solid rgba(255,255,255,.12) !important; color: #eee !important;
-}
-
-#attach-info { font-size: 12px; color: #aaa; padding: 2px 6px; }
-#attach-info p { margin: 0; }
-#clear-btn {
-    background: rgba(255,255,255,.07) !important;
-    border: 1px solid rgba(255,255,255,.12) !important; color: #eee !important;
-}
-
-/* ---------------- แผงตั้งค่าด้านขวา ---------------- */
-#side-panel {
-    background: rgba(255,255,255,.04) !important;
-    border: 1px solid rgba(255,255,255,.08) !important;
-    border-radius: 24px !important;
-    padding: 16px !important; gap: 10px !important;
-    align-self: flex-start; box-shadow: 0 10px 30px rgba(0,0,0,.25);
-}
-#side-panel .side-title { font-weight: 600; font-size: 12px; letter-spacing: .18em; color: #e8e8e8; margin-bottom: 4px; }
-#side-panel .block, #side-panel .form, #side-panel fieldset,
-#side-panel .wrap, #side-panel .container {
-    background: transparent !important; border: none !important; box-shadow: none !important;
-}
-#side-panel label, #side-panel label span,
-#side-panel span[data-testid="block-info"], #side-panel .block-title {
-    background: transparent !important; color: #cfcfd4 !important;
-}
-#side-panel input[type="text"], #side-panel .wrap-inner {
-    background: rgba(255,255,255,.07) !important; border: 1px solid rgba(255,255,255,.12) !important;
-    color: #f2f2f2 !important; border-radius: 14px !important;
-}
-#side-panel input[type="checkbox"] {
-    background-color: transparent !important; border: 1px solid #7d7f88 !important; accent-color: #f2f2f2;
-}
-#side-panel input[type="checkbox"]:checked {
-    background-color: #f2f2f2 !important; border-color: #f2f2f2 !important;
-}
-#new-btn {
-    background: transparent !important; color: #e8e8e8 !important;
-    border: 1px solid rgba(255,255,255,.25) !important;
-    border-radius: 999px !important; font-weight: 500 !important; margin-top: 6px;
-}
-#new-btn:hover { background: rgba(255,255,255,.1) !important; }
-
-@media (max-width: 800px) {
-    #topbar { grid-template-columns: 1fr auto; }
-    #topbar .navpill { display: none; }
-    #hero { min-height: 400px; padding-top: 250px; }
-    #strip { flex-wrap: wrap; }
-}
+#chips { flex-direction: column !important; flex-wrap: nowrap !important;
+         align-items: flex-start !important; gap: 8px !important; }
+#chips > * { flex: 0 0 auto !important; min-width: 0 !important; width: auto !important; }
 """
 
 
@@ -1537,16 +1764,10 @@ button.icon-button, .copy-button, .message button[aria-label] {
 # 7. ฟังก์ชันของหน้าเว็บ
 # =========================================================
 
-# (ชื่อหัวข้อ, คำอธิบายสั้นใต้ชื่อ, คำถามที่ส่งเมื่อกด)
 POPULAR = [
-    ("💡 อธิบาย AI", "เรียนรู้ ML แบบง่ายๆ",
-     "อธิบาย Machine Learning ให้เข้าใจง่ายสำหรับผู้เริ่มต้น"),
-    ("🐍 เขียนโค้ด Python", "อ่านและสรุปไฟล์ CSV",
-     "ช่วยเขียนโค้ด Python อ่านไฟล์ CSV และสรุปข้อมูล"),
-    ("🔬 วิทยาศาสตร์", "แบตเตอรี่ลิเธียมไอออน",
-     "อธิบายหลักการทำงานของแบตเตอรี่ลิเธียมไอออน"),
-    ("🤖 Automation", "ลดงานซ้ำด้วย Python",
-     "แนะนำวิธีทำ automation ลดงานซ้ำๆ ด้วย Python"),
+    ("💡 อธิบาย AI", "อธิบาย Machine Learning ให้เข้าใจง่ายสำหรับผู้เริ่มต้น"),
+    ("🐍 เขียนโค้ด Python", "ช่วยเขียนโค้ด Python อ่านไฟล์ CSV และสรุปข้อมูล"),
+    ("🔬 วิทยาศาสตร์", "อธิบายหลักการทำงานของแบตเตอรี่ลิเธียมไอออน"),
 ]
 
 
@@ -1556,50 +1777,57 @@ def update_language(language):
         make_topbar(language),
         make_header(language),
         gr.update(placeholder=t["placeholder"]),
-        gr.update(value=t["start"]),
     )
 
 
-def respond(message, history, language, use_search, use_kb, deep_think, files):
-    message = (message or "").strip()
+EMPTY_BOX = {"text": "", "files": []}
+
+
+def respond(value, history, language, use_search, use_kb, deep_think, files):
+    # ช่องพิมพ์แบบ Multimodal ส่งค่ามาเป็น {"text": ..., "files": [...]}
+    if isinstance(value, dict):
+        message = (value.get("text") or "").strip()
+    else:
+        message = (value or "").strip()
+
     history = history or []
     files = files or []
 
-    # แนบไฟล์แต่ไม่พิมพ์อะไร -> ให้สรุปไฟล์
+    # แนบไฟล์/รูปแต่ไม่พิมพ์อะไร -> ให้สรุปหรืออธิบายสิ่งที่แนบ
     if not message and files:
         message = (
-            "Please summarize the attached file(s)."
+            "Please summarize or describe what I attached."
             if language == LANG_EN
-            else "ช่วยสรุปเนื้อหาของไฟล์ที่แนบมา"
+            else "ช่วยสรุปหรืออธิบายสิ่งที่แนบมาให้หน่อย"
         )
 
     if not message:
-        yield history, ""
+        yield history, EMPTY_BOX
         return
 
     shown = history + [{"role": "user", "content": message}]
-    yield shown, ""
+    yield shown, EMPTY_BOX
 
     for partial in chat(
         message, history, language, use_search, use_kb, deep_think, files
     ):
-        yield shown + [{"role": "assistant", "content": partial}], ""
+        yield shown + [{"role": "assistant", "content": partial}], EMPTY_BOX
 
 
-def show_chat():
-    """ซ่อนหน้าแรก แล้วแสดงกล่องแชต"""
+def hide_intro():
+    # ซ่อนหน้าต้อนรับ แล้วแสดงกล่องแชต
     return gr.update(visible=False), gr.update(visible=True)
 
 
 def new_chat():
-    """กลับหน้าแรก ล้างแชตและไฟล์แนบ"""
+    # กลับไปหน้าต้อนรับ: ล้างแชต ไฟล์แนบ และช่องพิมพ์
     return (
-        gr.update(value=[], visible=False),   # chatbot (ล้างและซ่อน)
-        gr.update(visible=True),              # intro
-        [],                                   # files_state
-        gr.update(value="", visible=False),   # attach_info
-        gr.update(visible=False),             # clear_btn
-        "",                                   # box
+        gr.update(value=[], visible=False),
+        gr.update(visible=True),
+        [],
+        gr.update(value="", visible=False),
+        gr.update(visible=False),
+        EMPTY_BOX,
     )
 
 
@@ -1609,7 +1837,7 @@ def new_chat():
 
 blocks_kwargs = {"title": "Local AI"}
 launch_kwargs = {}
-chatbot_kwargs = {"elem_id": "chatbot", "show_label": False}
+chatbot_kwargs = {"elem_id": "chatbot", "show_label": False, "visible": False}
 
 if GR_MAJOR >= 6:
     launch_kwargs.update(theme=THEME, css=CSS)
@@ -1617,120 +1845,99 @@ else:
     blocks_kwargs.update(theme=THEME, css=CSS)
     chatbot_kwargs["type"] = "messages"
 
-FOCUS_JS = (
-    "() => setTimeout(() => { "
-    "const t = document.querySelector('#input-row textarea'); "
-    "if (t) t.focus(); }, 250)"
-)
-
 with gr.Blocks(**blocks_kwargs) as demo:
-    topbar = gr.HTML(make_topbar(LANG_THAI))
-    files_state = gr.State([])            # ไฟล์ที่แนบไว้ในแชตนี้
+    with gr.Row(elem_id="app-grid"):
 
-    with gr.Row(equal_height=False):
-        # ================= ซ้าย: หน้าแรก / แชต / ช่องพิมพ์ =================
-        with gr.Column(scale=4, min_width=360):
+        # ---- ซ้าย: โลโก้ + แถบเมนู ----
+        with gr.Column(elem_id="side", scale=0, min_width=84):
+            gr.HTML(make_logo())
+            with gr.Column(elem_id="side-pill"):
+                new_btn = gr.Button("＋", elem_id="new-btn", scale=0, min_width=48)
+                gr.HTML(make_avatar())
 
-            # ---------- หน้าแรก (ซ่อนเมื่อเริ่มแชต) ----------
-            with gr.Column(elem_id="intro") as intro:
+        # ---- กลาง: การ์ดหลัก (ต้อนรับ / แชต / ช่องพิมพ์) ----
+        with gr.Column(elem_id="main", scale=1, min_width=420):
+            with gr.Column(elem_id="cards-box") as cards_box:     # ซ่อนเมื่อเริ่มแชต
                 header = gr.HTML(make_header(LANG_THAI))
-                start_btn = gr.Button(
-                    get_page_text(LANG_THAI)["start"],
-                    elem_id="start-btn",
-                    scale=0,
-                )
 
-                with gr.Row(elem_id="strip"):
-                    card_btns = [
-                        gr.Button(f"{title}\n{sub}", elem_classes="pcard", min_width=160)
-                        for title, sub, _ in POPULAR
-                    ]
+            chatbot = gr.Chatbot(**chatbot_kwargs)
 
-            # ---------- แชต (แสดงเมื่อเริ่มแชต) ----------
-            chatbot = gr.Chatbot(visible=False, **chatbot_kwargs)
+            files_state = gr.State([])            # ไฟล์ที่แนบไว้ในแชตนี้
 
             with gr.Row():
                 attach_info = gr.Markdown("", visible=False, elem_id="attach-info")
                 clear_btn = gr.Button(
-                    "✖ ล้างไฟล์", visible=False, size="sm",
+                    "✖ ล้างไฟล์/รูป", visible=False, size="sm",
                     elem_id="clear-btn", scale=0, min_width=110,
                 )
 
-            # ---------- ช่องพิมพ์ ----------
-            with gr.Row(elem_id="input-row"):
-                attach = gr.UploadButton(
-                    "📎",
-                    file_count="multiple",
-                    file_types=FILE_TYPES,
-                    elem_id="attach-btn",
-                    scale=1,
-                    min_width=48,
-                )
-                box = gr.Textbox(
-                    placeholder=get_page_text(LANG_THAI)["placeholder"],
-                    show_label=False,
-                    lines=1,
-                    max_lines=5,
-                    scale=8,
-                    container=False,
-                )
-                send = gr.Button("➤", variant="primary", elem_id="send-btn", scale=1)
-
-        # ================= ขวา: ตั้งค่า =================
-        with gr.Column(scale=1, min_width=230, elem_id="side-panel"):
-            gr.HTML('<div class="side-title">⚙️ ตั้งค่า / Settings</div>')
-            language = gr.Dropdown(
-                choices=[LANG_THAI, LANG_EN, LANG_AUTO],
-                value=LANG_THAI,
-                label="ภาษา / Language",
+            # ช่องพิมพ์ที่แนบไฟล์ได้ และกด Ctrl+V วางรูป/ไฟล์ที่คัดลอกไว้ได้
+            box = gr.MultimodalTextbox(
+                placeholder=get_page_text(LANG_THAI)["placeholder"],
+                show_label=False,
+                lines=1,
+                max_lines=5,
+                file_count="multiple",
+                file_types=FILE_TYPES + IMAGE_TYPES,
+                sources=["upload"],
+                container=False,
+                elem_id="input-row",
             )
-            use_search = gr.Checkbox(label="🔎 ค้นหาเว็บ", value=False)
-            use_kb = gr.Checkbox(label="📚 ใช้ฐานความรู้ในเครื่อง", value=False)
-            deep_think = gr.Checkbox(label="🧠 คิดลึก (ช้ากว่า)", value=False)
-            new_btn = gr.Button("✚ แชตใหม่ / New chat", elem_id="new-btn")
+
+        # ---- ขวา: ป้ายโมเดล + หัวข้อแนะนำ + ตั้งค่า ----
+        with gr.Column(elem_id="right", scale=0, min_width=260):
+            topbar = gr.HTML(make_topbar(LANG_THAI))
+
+            card_btns = [
+                gr.Button(title, elem_classes="pcard", elem_id=f"pcard-{i}", min_width=160)
+                for i, (title, _) in enumerate(POPULAR, start=1)
+            ]
+
+            with gr.Column(elem_id="settings-card"):
+                gr.HTML(
+                    '<div style="font-size:11px;font-weight:600;letter-spacing:.14em;'
+                    'color:#15161a;">ตั้งค่า / SETTINGS</div>'
+                )
+                language = gr.Radio(
+                    choices=[LANG_THAI, LANG_EN, LANG_AUTO],
+                    value=LANG_THAI,
+                    show_label=False,
+                    elem_id="lang-radio",
+                )
+                with gr.Row(elem_id="chips"):
+                    use_search = gr.Checkbox(label="🔎 ค้นหาเว็บ", value=False)
+                    use_kb = gr.Checkbox(label="📚 ใช้ฐานความรู้ในเครื่อง", value=False)
+                    deep_think = gr.Checkbox(label="🧠 คิดลึก (ช้ากว่า)", value=False)
 
     chat_inputs = [box, chatbot, language, use_search, use_kb, deep_think, files_state]
 
-    # ส่งข้อความ (Enter / ปุ่มส่ง)
-    for trigger in (box.submit, send.click):
-        trigger(show_chat, outputs=[intro, chatbot], queue=False).then(
-            respond, inputs=chat_inputs, outputs=[chatbot, box]
-        )
+    box.submit(hide_intro, outputs=[cards_box, chatbot], queue=False).then(
+        ingest,
+        inputs=[box, files_state],
+        outputs=[files_state, attach_info, clear_btn, box],
+        queue=False,
+    ).then(respond, inputs=chat_inputs, outputs=[chatbot, box])
 
-    # กดการ์ดหัวข้อ -> ใส่คำถามแล้วส่งเลย
-    for btn, (_, _, prompt) in zip(card_btns, POPULAR):
-        btn.click(lambda p=prompt: p, outputs=box, queue=False).then(
-            show_chat, outputs=[intro, chatbot], queue=False
+    for btn, (_, prompt) in zip(card_btns, POPULAR):
+        btn.click(lambda p=prompt: {"text": p, "files": []}, outputs=box, queue=False).then(
+            hide_intro, outputs=[cards_box, chatbot], queue=False
         ).then(respond, inputs=chat_inputs, outputs=[chatbot, box])
 
-    # ปุ่มเริ่มแชต -> ไปหน้าแชต แล้วโฟกัสช่องพิมพ์
-    start_btn.click(show_chat, outputs=[intro, chatbot], queue=False).then(
-        None, None, None, js=FOCUS_JS
-    )
-
-    # แนบไฟล์ / ล้างไฟล์
-    attach.upload(
-        attach_files,
-        inputs=[attach, files_state],
-        outputs=[files_state, attach_info, clear_btn, attach],
-    )
     clear_btn.click(
         clear_files,
         outputs=[files_state, attach_info, clear_btn],
     )
 
-    # แชตใหม่
     new_btn.click(
         new_chat,
-        outputs=[chatbot, intro, files_state, attach_info, clear_btn, box],
+        outputs=[chatbot, cards_box, files_state, attach_info, clear_btn, box],
         queue=False,
     )
 
-    # เปลี่ยนภาษา
     language.change(
         update_language,
         inputs=[language],
-        outputs=[topbar, header, box, start_btn],
+        outputs=[topbar, header, box],
         queue=False,
     )
 
@@ -1738,6 +1945,10 @@ with gr.Blocks(**blocks_kwargs) as demo:
 if __name__ == "__main__":
     HOST, PORT = "127.0.0.1", 7860
     demo.queue()
+
+    # โหลดโมเดลล่วงหน้าเบื้องหลัง ระหว่างที่หน้าต่างกำลังเปิด
+    if WARM_UP:
+        threading.Thread(target=warm_up, daemon=True).start()
 
     try:
         import webview        # pip install pywebview
@@ -1761,10 +1972,11 @@ if __name__ == "__main__":
         webview.create_window(
             "Local AI",
             f"http://{HOST}:{PORT}",
-            width=1920,
-            height=1080,
+            width=1100,
+            height=820,
             resizable=True,
-            min_size=(480, 600),
+            min_size=(420, 600),
+            maximized=True,
         )
         webview.start()       # ปิดหน้าต่างแล้วโปรแกรมจะจบการทำงาน
         demo.close()
